@@ -7,14 +7,6 @@ import torch
 from scionh.compile_env import ensure_compile_env
 from scionh.optim.parametrization import (
     resolve_schedule,
-    schedule_at_step,
-)
-from scionh.optim.auxiliary import (
-    build_derf_optimizers,
-    build_kv_decoder_optimizer,
-    configure_derf_training,
-    step_derf_optimizers,
-    zero_derf_optimizers,
 )
 from scionh.optim.setup import (
     OPTIMIZER_NAME,
@@ -36,14 +28,7 @@ from scionh.models.gpt import (
     BatchSource,
 )
 from scionh.models.inspection import (
-    derf_state,
-    derf_state_text,
-    kv_cache_summary,
-    kv_decoder_state,
-    kv_decoder_state_text,
     parameter_summary,
-    rmsnorm_affine_state,
-    rmsnorm_affine_state_text,
 )
 from scionh.probes.convergence import ConvergenceProbe
 from scionh.probes.line import (
@@ -208,8 +193,6 @@ class TrainingComponents:
     source: BatchSource
     eval_batches: dict | None
     opt: object
-    derf_opts: dict
-    kv_decoder_opt: object | None
     conv_probe: ConvergenceProbe | None
     model: object
     compile_seconds: float
@@ -228,12 +211,9 @@ class TrainingSchedule:
 class TrainingMetadata:
     lr_peak: float
     beta: float
-    derf_beta: float
-    kv_decoder_beta: float
     state_half_life: float
     io_weights: str
     params_info: dict
-    kv_info: dict
     deepnorm_alpha: float
     group_text: str
 
@@ -261,8 +241,6 @@ class TrainingProgress:
 class StepRates:
     all_lrs: dict
     lr: float
-    derf_lr: float
-    kv_decoder_lr: float
 
 
 @dataclass
@@ -286,7 +264,6 @@ def build_training_components(
     metrics = MetricsLogger(args.metrics_jsonl, args.run_name)
     dataset = load_dataset(args)
     raw_model = build_model(args, dataset, device)
-    configure_derf_training(raw_model, args)
     source = BatchSource(
         dataset.train,
         dataset.val,
@@ -299,8 +276,6 @@ def build_training_components(
     eval_batches = fixed_eval_batches(args, source)
     opt = build_optimizer(raw_model, args, device)
     deepnorm_calibration = maybe_calibrate_deepnorm(raw_model, source, args)
-    derf_opts = build_derf_optimizers(raw_model, args)
-    kv_decoder_opt = build_kv_decoder_optimizer(raw_model, args)
     conv_probe = build_convergence_probe(raw_model, opt, args)
     model, compile_seconds = maybe_compile(raw_model, source, args, amp_dtype, device)
     if compile_seconds:
@@ -312,8 +287,6 @@ def build_training_components(
         source=source,
         eval_batches=eval_batches,
         opt=opt,
-        derf_opts=derf_opts,
-        kv_decoder_opt=kv_decoder_opt,
         conv_probe=conv_probe,
         model=model,
         compile_seconds=compile_seconds,
@@ -353,19 +326,14 @@ def make_training_schedule(args) -> TrainingSchedule:
     )
 
 
-def collect_training_metadata(
-    raw_model: GPT, opt, derf_opts: dict, kv_decoder_opt
-) -> TrainingMetadata:
+def collect_training_metadata(raw_model: GPT, opt) -> TrainingMetadata:
     first_group = opt.param_groups[0]
     return TrainingMetadata(
         lr_peak=float(first_group.get("lr_peak", first_group["lr"])),
         beta=float(first_group.get("beta", math.nan)),
-        derf_beta=next(iter(derf_opts.values())).beta if derf_opts else math.nan,
-        kv_decoder_beta=kv_decoder_opt.beta if kv_decoder_opt is not None else math.nan,
         state_half_life=float(first_group.get("state_half_life", math.nan)),
         io_weights=optimizer_io_label(raw_model),
         params_info=parameter_summary(raw_model),
-        kv_info=kv_cache_summary(raw_model),
         deepnorm_alpha=raw_model.cfg.resolved_deepnorm_alpha,
         group_text=format_optimizer_schedule(opt),
     )
@@ -374,7 +342,6 @@ def collect_training_metadata(
 def print_training_config(
     args, schedule: TrainingSchedule, metadata: TrainingMetadata
 ) -> None:
-    kv_info = metadata.kv_info
     params_info = metadata.params_info
     print(
         "schedule "
@@ -386,13 +353,6 @@ def print_training_config(
         f"beta={metadata.beta:.6f} "
         f"optimizer={OPTIMIZER_NAME} update={args.hyperball_update} "
         f"compile_mode={args.compile_mode} "
-        f"norm={args.norm_type} derf_lr={args.derf_lr:.6f} "
-        f"derf_beta={metadata.derf_beta:.6f} derf_shape={args.train_derf_shape} "
-        f"kv_cache={kv_info['type']} kv_dim={kv_info['cache_dim']}/"
-        f"{kv_info['original_cache_dim']} kv_ratio={kv_info['cache_ratio']:.3f} "
-        f"kv_key_rank={kv_info['key_rank']} kv_value_rank={kv_info['value_rank']} "
-        f"kv_decoder_lr={args.kv_decoder_lr:.6f} "
-        f"kv_decoder_beta={metadata.kv_decoder_beta:.6f} "
         f"params={params_info['total']} trainable_params={params_info['trainable']} "
         f"dropout={args.dropout:.3f} "
         f"resid_scale={args.resid_scale:.6f} "
@@ -400,8 +360,6 @@ def print_training_config(
         f"deepnorm_alpha={metadata.deepnorm_alpha:.6g} "
         f"deepnorm_branch_scale={args.deepnorm_branch_scale:.6g} "
         f"deepnorm_calibrate={args.deepnorm_calibrate_branches} "
-        f"lns={args.lns} "
-        f"attn={args.attn_type} "
         f"seed={args.seed} data_seed={resolve_data_seed(args)} "
         f"eval_seed={resolve_eval_seed(args)} fixed_eval={args.fixed_eval_batches} "
         f"hidden_ulmo={args.hidden_ulmo} "
@@ -419,7 +377,6 @@ def write_config_metrics(
     schedule: TrainingSchedule,
     metadata: TrainingMetadata,
     deepnorm_calibration: dict,
-    derf_opts: dict,
 ) -> None:
     metrics.write(
         "config",
@@ -440,12 +397,6 @@ def write_config_metrics(
             "lr_peak": metadata.lr_peak,
             "state_half_life": metadata.state_half_life,
             "beta": metadata.beta,
-            "derf_lr_peak": args.derf_lr,
-            "derf_state_half_life": args.derf_state_half_life,
-            "derf_beta": metadata.derf_beta,
-            "derf_groups": list(derf_opts),
-            "kv_decoder_lr_peak": args.kv_decoder_lr,
-            "kv_decoder_beta": metadata.kv_decoder_beta,
             "update_rule": args.hyperball_update,
             "groups": metadata.group_text,
         },
@@ -458,13 +409,6 @@ def write_config_metrics(
             "deepnorm_branch_scale": args.deepnorm_branch_scale,
             "deepnorm_calibrate_branches": args.deepnorm_calibrate_branches,
             "deepnorm_calibration": deepnorm_calibration,
-            "lns": args.lns,
-            "norm_type": args.norm_type,
-            "derf_alpha": args.derf_alpha,
-            "derf_shift": args.derf_shift,
-            "train_derf_shape": args.train_derf_shape,
-            "attn_type": args.attn_type,
-            "kv_cache": metadata.kv_info,
             "hidden_ulmo": args.hidden_ulmo,
             "block_ulmo_parts": args.block_ulmo_parts,
             "block_ulmo_axis": args.block_ulmo_axis,
@@ -487,8 +431,6 @@ def warn_training_options(args, line_curve_scales: list[float]) -> None:
 def schedule_step_rates(
     args,
     opt,
-    derf_opts: dict,
-    kv_decoder_opt,
     step: int,
     schedule: TrainingSchedule,
 ) -> StepRates:
@@ -500,47 +442,10 @@ def schedule_step_rates(
         schedule.decay_steps,
         args.schedule_floor,
     )
-    derf_lr = schedule_derf_lr(args, derf_opts, step, schedule)
-    kv_decoder_lr = schedule_kv_decoder_lr(args, kv_decoder_opt, step, schedule)
     return StepRates(
         all_lrs=current_lrs,
         lr=current_lrs.get("hidden", next(iter(current_lrs.values()))),
-        derf_lr=derf_lr,
-        kv_decoder_lr=kv_decoder_lr,
     )
-
-
-def schedule_derf_lr(
-    args, derf_opts: dict, step: int, schedule: TrainingSchedule
-) -> float:
-    if not derf_opts:
-        return 0.0
-    lr = schedule_at_step(
-        step,
-        args.max_iters,
-        args.derf_lr,
-        args.schedule_floor * args.derf_lr,
-        schedule.warmup_steps,
-        schedule.decay_steps,
-    )
-    for derf_group_opt in derf_opts.values():
-        derf_group_opt.lr = lr
-    return lr
-
-
-def schedule_kv_decoder_lr(args, kv_decoder_opt, step: int, schedule: TrainingSchedule) -> float:
-    if kv_decoder_opt is None:
-        return 0.0
-    lr = schedule_at_step(
-        step,
-        args.max_iters,
-        kv_decoder_opt.lr_peak,
-        args.schedule_floor * kv_decoder_opt.lr_peak,
-        schedule.warmup_steps,
-        schedule.decay_steps,
-    )
-    kv_decoder_opt.lr = lr
-    return lr
 
 
 def should_evaluate(args, step: int) -> bool:
@@ -613,9 +518,6 @@ def collect_eval_stats(
         if args.track_step_stats
         else {},
         "weight_rms": optimizer_rms_state(components.opt),
-        "derf": derf_state(components.raw_model),
-        "norm_affine": rmsnorm_affine_state(components.raw_model),
-        "kv_decoder": kv_decoder_state(components.raw_model),
     }
 
 
@@ -688,17 +590,13 @@ def print_eval_status(
 ) -> None:
     print(
         f"step {step:5d} | lr {rates.lr:.6f} beta {metadata.beta:.6f} "
-        f"derf_lr {rates.derf_lr:.6f} "
-        f"kv_decoder_lr {rates.kv_decoder_lr:.6f} | "
+        f"| "
         f"train {train_loss:.4f} | val {val_loss:.4f} | "
         f"best_val {progress.best_val:.4f} | train_seconds {timing.elapsed:.3f} | "
         f"tok/s {timing.total_tokens / timing.elapsed:.0f} "
         f"train_tok/s {timing.total_tokens / timing.train_elapsed:.0f}"
         f"{cuda_memory_text(device)}{logit_stats_text(logit_stats)}"
         f"{rms_state_text(eval_stats['weight_rms'])}"
-        f"{derf_state_text(eval_stats['derf'])}"
-        f"{rmsnorm_affine_state_text(eval_stats['norm_affine'])}"
-        f"{kv_decoder_state_text(eval_stats['kv_decoder'])}"
         f"{step_stats_text(eval_stats['opt'])}"
     )
 
@@ -732,8 +630,6 @@ def write_eval_metrics(
         step=step,
         total_opt_steps=progress.total_opt_steps,
         lr=rates.lr,
-        derf_lr=rates.derf_lr,
-        kv_decoder_lr=rates.kv_decoder_lr,
         beta=metadata.beta,
         lrs=rates.all_lrs,
         train_loss=train_loss,
@@ -748,9 +644,6 @@ def write_eval_metrics(
         cuda_memory=memory,
         logit_stats=logit_stats,
         weight_rms=eval_stats["weight_rms"],
-        derf=eval_stats["derf"],
-        norm_affine=eval_stats["norm_affine"],
-        kv_decoder=eval_stats["kv_decoder"],
         step_stats=eval_stats["opt"],
     )
 
@@ -997,10 +890,6 @@ def run_training_step(
 
 def zero_training_optimizers(components: TrainingComponents) -> None:
     components.opt.zero_grad(set_to_none=True)
-    if components.derf_opts:
-        zero_derf_optimizers(components.derf_opts, set_to_none=True)
-    if components.kv_decoder_opt is not None:
-        components.kv_decoder_opt.zero_grad(set_to_none=True)
 
 
 def accumulate_microbatches(
@@ -1064,10 +953,6 @@ def capture_training_step_stats(args, opt, line_active: bool):
 
 def step_training_optimizers(components: TrainingComponents) -> None:
     components.opt.step()
-    if components.derf_opts:
-        step_derf_optimizers(components.derf_opts)
-    if components.kv_decoder_opt is not None:
-        components.kv_decoder_opt.step()
 
 
 def consume_training_step_stats(
@@ -1206,12 +1091,7 @@ def train(args):
 
     components = build_training_components(args, device, amp_dtype)
     schedule = make_training_schedule(args)
-    metadata = collect_training_metadata(
-        components.raw_model,
-        components.opt,
-        components.derf_opts,
-        components.kv_decoder_opt,
-    )
+    metadata = collect_training_metadata(components.raw_model, components.opt)
     print_training_config(args, schedule, metadata)
     write_config_metrics(
         args,
@@ -1219,7 +1099,6 @@ def train(args):
         schedule,
         metadata,
         components.deepnorm_calibration,
-        components.derf_opts,
     )
     warn_training_options(args, line_curve_scales)
 
@@ -1229,8 +1108,6 @@ def train(args):
         rates = schedule_step_rates(
             args,
             components.opt,
-            components.derf_opts,
-            components.kv_decoder_opt,
             step,
             schedule,
         )

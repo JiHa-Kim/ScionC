@@ -3,10 +3,10 @@
 A compact Tiny Shakespeare GPT research sandbox organized by category:
 
 - `scionh/optim/`: Hyperball optimizer and schedule parametrization helpers.
-- `scionh/ulmos/`: ULMOs, Gram-NS, and streaming SVD helpers.
-- `scionh/models/`: compact GPT model and tiny Shakespeare data utilities.
-- `scionh/probes/`: convergence, line, and optimizer-step stats probes.
-- `scionh/experiments/`: command generators for registered experiment matrices.
+- `scionh/ulmos/`: ULMOs, Gram-NS, and streaming-SVD helpers.
+- `scionh/models/`: compact GPT model with DeepNorm default and Pre-LN baseline.
+- `scionh/probes/`: focused diagnostics and training-step performance probes.
+- `scionh/experiments/`: registered experiment helpers.
 - `scionh/train_shakespeare.py`: training entrypoint.
 
 ## Active Recipe: Hyperball
@@ -44,6 +44,8 @@ The active coordinates are:
 ## Defaults
 
 - optimizer: Hyperball
+- block type: DeepNorm by default; use `--block-type preln` for the Pre-LN
+  baseline
 - hidden ULMO: Gram Newton-Schulz
 - input/output ULMOs: untied ColNorm + Sign; tied Sign + Sign
 - batch size: 64
